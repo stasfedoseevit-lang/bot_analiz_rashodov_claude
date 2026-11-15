@@ -881,7 +881,9 @@ async def main() -> None:
     log.info("Бот запущен: @%s | хранилище: %s | модель: %s", me.username, config.STORAGE, config.MODEL)
     print(f"\nБот @{me.username} запущен. Напишите ему в Telegram. Остановка: Ctrl+C\n")
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        # Сообщения, присланные, пока бот был выключен или перезапускался, не выбрасываем:
+        # иначе чек, отправленный в эту минуту, молча пропадёт.
+        await bot.delete_webhook(drop_pending_updates=False)
     except TelegramNetworkError as e:
         log.warning("Не удалось сбросить webhook (%s), продолжаю", e)
     recon_task = None

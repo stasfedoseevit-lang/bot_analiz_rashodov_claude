@@ -3,6 +3,13 @@ chcp 65001 >nul
 set PYTHONUTF8=1
 cd /d "%~dp0"
 
+if not exist settings.txt (
+    copy settings.example.txt settings.txt >nul
+    echo Создан файл settings.txt. Откройте его в Блокноте, впишите ключи и запустите start.bat снова.
+    pause
+    exit /b 1
+)
+
 where python >nul 2>nul
 if errorlevel 1 (
     echo Python не найден. Установите его с сайта python.org и поставьте галочку "Add python.exe to PATH".

@@ -5,7 +5,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / "settings.txt")
+SETTINGS_FILE = BASE_DIR / "settings.txt"
+if not SETTINGS_FILE.exists():
+    raise SystemExit(
+        "Нет файла settings.txt. Скопируйте settings.example.txt в settings.txt "
+        "и впишите в него ключи."
+    )
+load_dotenv(SETTINGS_FILE)
 
 
 def _need(name: str) -> str:

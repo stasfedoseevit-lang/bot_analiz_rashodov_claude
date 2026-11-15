@@ -26,7 +26,7 @@
   recon.py            — сверка с выписками: сопоставление, Excel/CSV, «не нужно»
   categories.py       — список категорий и подкатегорий
   config.py           — чтение настроек из settings.txt
-  settings.txt        — ШАБЛОН настроек (ключи вписываются на сервере, сюда не кладутся)
+  settings.example.txt — ШАБЛОН настроек; на сервере его копия settings.txt с ключами
   requirements.txt    — нужные библиотеки Python
   expense-bot-claude.service — служба systemd (бот работает 24/7 и сам перезапускается)
   install_server.sh   — установка на сервер одной командой
@@ -44,15 +44,16 @@
 
 УСТАНОВКА НА НОВЫЙ СЕРВЕР (Ubuntu)
   1. Скопируйте папку на сервер в /root/expense_bot_test/
-     (из Termux: scp expense_bot_full.zip root@АДРЕС:/root/ , затем на сервере
-      python3 -m zipfile -e expense_bot_full.zip /root/  и переименуйте папку
-      expense_bot в expense_bot_test, если её нет).
+     (на сервере: git clone АДРЕС_РЕПОЗИТОРИЯ /root/repo, затем
+      cp -r /root/repo/expense_bot /root/expense_bot_test, если папки ещё нет).
+     Если settings.txt на сервере ещё нет: cp settings.example.txt settings.txt и заполните.
   2. Положите туда settings.txt с ключами и credentials.json.
   3. На сервере: cd /root/expense_bot_test && bash install_server.sh
 
 ОБНОВЛЕНИЕ КОДА
   Замените .py-файлы и выполните: systemctl restart expense-bot-claude
-  settings.txt и credentials.json при этом не трогайте.
+  settings.txt и credentials.json при этом не трогайте (в репозитории их нет,
+  поэтому копирование новых файлов поверх их не затрёт).
 
 ПОЛЕЗНЫЕ КОМАНДЫ (на сервере)
   systemctl status expense-bot-claude     — работает ли бот

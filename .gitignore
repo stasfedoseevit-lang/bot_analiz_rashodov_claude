@@ -1,0 +1,13 @@
+# Секреты: лежат только на сервере / компьютере, в репозиторий не попадают
+expense_bot/settings.txt
+expense_bot/credentials.json
+
+# Данные и журналы, которые бот создаёт сам
+expense_bot/*.csv
+expense_bot/ignored_ops.json
+expense_bot/bot.log*
+
+# Python
+venv/
+__pycache__/
+*.pyc
