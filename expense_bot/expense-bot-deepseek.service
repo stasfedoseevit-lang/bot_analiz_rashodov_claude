@@ -1,11 +1,11 @@
 [Unit]
-Description=Telegram-бот учёта трат (Claude)
+Description=Telegram-бот учёта трат (DeepSeek)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-WorkingDirectory=/root/expense_bot_test
-ExecStart=/root/expense_bot_test/venv/bin/python bot.py
+WorkingDirectory=/root/expense_bot_deepseek
+ExecStart=/root/expense_bot_deepseek/venv/bin/python bot.py
 Environment=PYTHONUTF8=1
 Restart=always
 RestartSec=10
@@ -13,7 +13,7 @@ RestartSec=10
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/root/expense_bot_test
+ReadWritePaths=/root/expense_bot_deepseek
 
 [Install]
 WantedBy=multi-user.target

@@ -8,7 +8,7 @@ import pytest
 import bot as B
 import config
 import storage
-from claude_parse import ParsedExpense, StatementOp
+from ai_parse import ParsedExpense, StatementOp
 
 
 class FakeBot:

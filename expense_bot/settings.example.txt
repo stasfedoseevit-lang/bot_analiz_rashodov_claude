@@ -4,11 +4,13 @@
 # Настройки бота. Откройте этот файл в Блокноте, впишите значения справа от знака =
 # и сохраните. Кавычки не нужны. Файл никому не показывайте: тут секретные ключи.
 
-# Токен бота из @BotFather (длинная строка с двоеточием)
+# Токен бота из @BotFather (длинная строка с двоеточием).
+# Если параллельно работает бот на Claude, нужен ДРУГОЙ бот и другой токен:
+# два бота с одним токеном мешают друг другу.
 TELEGRAM_TOKEN=СЮДА_ТОКЕН_БОТА
 
-# Ключ API Claude (из раздела API keys на platform.claude.com)
-ANTHROPIC_API_KEY=СЮДА_КЛЮЧ_CLAUDE
+# Ключ API DeepSeek (platform.deepseek.com, раздел API keys; баланс пополняется там же)
+DEEPSEEK_API_KEY=СЮДА_КЛЮЧ_DEEPSEEK
 
 # Ваш Telegram ID (число CHAT_ID из старого bot.py). Если ботом будут пользоваться
 # несколько человек, перечислите ID через запятую.
@@ -20,10 +22,10 @@ ALLOWED_USER_IDS=СЮДА_ВАШ_ID
 STORAGE=sheets
 
 # Для STORAGE=sheets: название таблицы (откройте её с правами редактора для адреса client_email из credentials.json)
-SHEET_NAME=Analiz_raskhodov_Claude
+SHEET_NAME=Analiz_raskhodov_DeepSeek
 
-# Модель Claude. Haiku самая дешёвая и для чтения чеков её достаточно.
-CLAUDE_MODEL=claude-haiku-5-5
+# Модель DeepSeek. Скриншоты чеков понимает только deepseek-flash (Pro картинки не принимает).
+DEEPSEEK_MODEL=deepseek-flash
 
 # Часовой пояс для даты по умолчанию
 TIMEZONE=Europe/Moscow

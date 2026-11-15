@@ -23,7 +23,8 @@ def _need(name: str) -> str:
 
 
 TELEGRAM_TOKEN = _need("TELEGRAM_TOKEN")
-ANTHROPIC_API_KEY = _need("ANTHROPIC_API_KEY")
+DEEPSEEK_API_KEY = _need("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
 
 try:
     ALLOWED_USER_IDS = {
@@ -34,7 +35,8 @@ except ValueError:
 if not ALLOWED_USER_IDS:
     raise SystemExit("В settings.txt не заполнено поле ALLOWED_USER_IDS (ваш Telegram ID).")
 
-MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5").strip()
+# Картинки (скриншоты чеков) понимает только deepseek-flash
+MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash").strip()
 STORAGE = os.getenv("STORAGE", "csv").strip().lower()          # csv или sheets
 SHEET_NAME = os.getenv("SHEET_NAME", "Analiz_raskhodov").strip()
 GOOGLE_CREDENTIALS_FILE = BASE_DIR / os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json").strip()
@@ -43,7 +45,7 @@ FALLBACK_FILE = BASE_DIR / "unsaved_expenses.csv"
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow").strip()
 # Ходить к Telegram только по IPv4 (помогает, если на Windows подключение виснет)
 FORCE_IPV4 = os.getenv("FORCE_IPV4", "yes").strip().lower() in ("1", "yes", "true", "да")
-# Быстрый режим Claude: без «обдумывания» и с минимальным усилием (для чтения чека хватает)
+# Быстрый режим: без «обдумывания» (для чтения чека хватает, ответ приходит быстрее)
 FAST_MODE = os.getenv("FAST_MODE", "yes").strip().lower() in ("1", "yes", "true", "да")
 
 # Еженедельная сверка с выписками: напоминание в выбранный день недели и час (0 = понедельник)

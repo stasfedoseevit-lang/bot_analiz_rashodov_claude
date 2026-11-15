@@ -1,4 +1,4 @@
-"""Telegram-бот учёта трат: скриншот или текст -> Claude читает сумму -> вы выбираете категорию -> запись."""
+"""Telegram-бот учёта трат: скриншот или текст -> DeepSeek читает сумму -> вы выбираете категорию -> запись."""
 import asyncio
 import html
 import json
@@ -24,7 +24,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 import config
 import recon
 from categories import CATEGORIES, OTHER, WORK
-from claude_parse import (
+from ai_parse import (
     AMOUNT_DIGITS, ParsedExpense, StatementOp, friendly_error, read_expense, read_statement, rub_to_thousands,
 )
 from storage import flush_fallback, get_storage, normalize_merchant, save_fallback
@@ -249,14 +249,14 @@ async def fetch_image(bot: Bot, file_id: str) -> bytes:
 # ---------------------------------------------------------------- основной поток
 #
 # Как идут чеки:
-#   1. submit() сразу запускает распознавание в фоне (Claude читает чек, пока вы отвечаете
+#   1. submit() сразу запускает распознавание в фоне (DeepSeek читает чек, пока вы отвечаете
 #      на вопросы по предыдущему) и кладёт чек в очередь.
 #   2. pump_queue() — один на пользователя. Когда текущей траты нет, он берёт первый чек
 #      из очереди, дожидается распознавания (уже без блокировки: кнопки и ответы работают)
 #      и показывает вопрос о категории.
 #   3. finalize() / «Не трата» освобождают место и снова будят pump_queue().
 
-RECOGNIZE_PARALLEL = 3          # сколько чеков одновременно читает Claude
+RECOGNIZE_PARALLEL = 3          # сколько чеков одновременно читает DeepSeek
 _recognize_sem: Optional[asyncio.Semaphore] = None
 
 
@@ -289,7 +289,7 @@ async def keep_typing(bot: Bot, chat_id: int) -> None:
 
 
 async def recognize(bot: Bot, item: Item) -> Recognized:
-    """Скачивает чек и отдаёт его Claude. Ошибки не выбрасывает: они попадают в parsed.error."""
+    """Скачивает чек и отдаёт его DeepSeek. Ошибки не выбрасывает: они попадают в parsed.error."""
     if item.kind == "op":
         return Recognized(item.parsed, item.raw or "Из выписки", item.file_id)
     async with _recognize_limit():
@@ -335,7 +335,7 @@ def waiting_count(st: UserState) -> int:
 
 
 async def submit(bot: Bot, st: UserState, item: Item) -> None:
-    """Принимает чек. Вызывается под st.lock и не ждёт Claude."""
+    """Принимает чек. Вызывается под st.lock и не ждёт DeepSeek."""
     start_recognition(bot, item)
     busy = st.current is not None or bool(st.queue)
     st.queue.append(item)
@@ -353,7 +353,7 @@ async def pump_queue(bot: Bot, st: UserState) -> None:
                     return
                 item = st.queue[0]
                 start_recognition(bot, item)
-            # Ждём Claude без блокировки: в это время работают кнопки, /cancel и приём новых чеков
+            # Ждём DeepSeek без блокировки: в это время работают кнопки, /cancel и приём новых чеков
             typing = None if item.task.done() else asyncio.create_task(keep_typing(bot, st.chat_id))
             try:
                 await asyncio.wait({item.task})
@@ -395,7 +395,7 @@ async def present(bot: Bot, st: UserState, item: Item, rec: Recognized, dup, now
         bank=parsed.bank, raw=rec.raw, photo_id=rec.photo_id, skip_key=item.key, hint=hint,
     )
     if item.kind != "op":
-        log.info("Время: скачивание %.1f с, Claude %.1f с", rec.t_download, rec.t_ai - rec.t_download)
+        log.info("Время: скачивание %.1f с, DeepSeek %.1f с", rec.t_download, rec.t_ai - rec.t_download)
 
     # Повтор: такая же трата уже есть в таблице -> не спрашиваем, сообщаем и идём дальше
     if dup is not None:
@@ -584,7 +584,7 @@ def welcome_text() -> str:
         + recon_line +
         "/stats — траты за месяц по категориям (/stats 10 — за октябрь)\n"
         "/cancel — сбросить текущую трату, очередь и сверку\n"
-        "/check — проверить связь с Claude и таблицей"
+        "/check — проверить связь с DeepSeek и таблицей"
     )
 
 
@@ -669,11 +669,11 @@ async def cmd_check(message: Message, bot: Bot) -> None:
     parsed = await read_expense(text="Покупка 150 руб. Магнит. 16.10.2026 12:00", today=now_local())
     took = time.monotonic() - t_start
     if parsed.error:
-        lines.append(f"❌ Claude: {esc(parsed.error)}")
+        lines.append(f"❌ DeepSeek: {esc(parsed.error)}")
     elif abs(parsed.amount - 0.15) < 0.0005:
-        lines.append(f"✅ Claude отвечает за {took:.1f} с (модель {esc(config.MODEL)}), сумма прочитана верно.")
+        lines.append(f"✅ DeepSeek отвечает за {took:.1f} с (модель {esc(config.MODEL)}), сумма прочитана верно.")
     else:
-        lines.append(f"⚠️ Claude отвечает, но сумма прочитана как {fmt_rub(parsed.amount)}, ждали 150 ₽.")
+        lines.append(f"⚠️ DeepSeek отвечает, но сумма прочитана как {fmt_rub(parsed.amount)}, ждали 150 ₽.")
     try:
         lines.append(f"✅ Хранилище: {esc(get_storage().label)}")
     except Exception as e:  # noqa: BLE001
@@ -1183,7 +1183,7 @@ def item_to_dict(item: Item) -> dict:
     if item.kind != "op" and t is not None and t.done() and not t.cancelled() and t.exception() is None:
         rec = t.result()
         if not rec.parsed.error:
-            # Claude уже прочитал чек: сохраняем результат, чтобы не платить за чтение второй раз
+            # DeepSeek уже прочитал чек: сохраняем результат, чтобы не платить за чтение второй раз
             d.update(kind="op", parsed=parsed_to_dict(rec.parsed), raw=rec.raw, file_id=rec.photo_id)
     return d
 

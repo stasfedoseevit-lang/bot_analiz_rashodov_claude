@@ -1,5 +1,16 @@
-БОТ УЧЁТА ТРАТ (Analiz_trat_Claude) — СОСТАВ И РАБОТА НА СЕРВЕРЕ
+БОТ УЧЁТА ТРАТ (версия на DeepSeek) — СОСТАВ И РАБОТА НА СЕРВЕРЕ
 ==================================================================
+
+ЧЕМ ОТЛИЧАЕТСЯ ОТ ВЕРСИИ НА CLAUDE
+  Всё то же самое (очередь, повторы, сверка, подсказки, /stats, отмена записи),
+  но чеки и выписки читает модель DeepSeek (deepseek-flash). Отличия:
+  - PDF DeepSeek напрямую не принимает: бот сам достаёт из PDF текст, а если это скан
+    без текста — отправляет страницы картинками (чек: 2 страницы, выписка: до 15).
+  - Строгой JSON-схемы у DeepSeek нет, есть «JSON-режим»; поля проверяет сам бот.
+  - Длинные выписки отправляются частями по ~12 000 символов, результаты складываются.
+  - Своя папка (/root/expense_bot_deepseek) и своя служба (expense-bot-deepseek),
+    поэтому может работать на одном сервере вместе с версией на Claude.
+    Нужен ОТДЕЛЬНЫЙ Telegram-бот (свой токен) и лучше отдельная копия таблицы.
 
 ЧТО УМЕЕТ
   - Читает трату со скриншота (фото или картинка файлом), PDF-чека/справки или текста СМС.
@@ -23,7 +34,7 @@
     запоминаются на полгода.
 
 КОМАНДЫ БОТА
-  /check      — проверить связь с Claude и таблицей
+  /check      — проверить связь с DeepSeek и таблицей
   /reconcile  — запустить сверку с выписками вручную
   /stats      — траты за текущий месяц по категориям (/stats 10 — за октябрь)
   /cancel     — сбросить текущую трату, очередь и сверку
@@ -31,20 +42,20 @@
 
 ФАЙЛЫ
   bot.py              — основной код бота (Telegram, вопросы, очередь, повторы, сверка)
-  claude_parse.py     — чтение скриншотов, PDF, текста и выписок через Claude
+  ai_parse.py         — чтение скриншотов, PDF, текста и выписок через DeepSeek
   storage.py          — запись в Google Таблицу / CSV, проверка записи, чтение реестра
   recon.py            — сверка с выписками: сопоставление, Excel/CSV, «не нужно»
   categories.py       — список категорий и подкатегорий
   config.py           — чтение настроек из settings.txt
   settings.example.txt — ШАБЛОН настроек; на сервере его копия settings.txt с ключами
   requirements.txt    — нужные библиотеки Python
-  expense-bot-claude.service — служба systemd (бот работает 24/7 и сам перезапускается)
+  expense-bot-deepseek.service — служба systemd (бот работает 24/7 и сам перезапускается)
   install_server.sh   — установка на сервер одной командой
   start.bat, README.txt — запуск для проверки на компьютере с Windows
   tests/              — автоматические проверки (для разработки, боту не нужны)
 
-ЧЕГО В АРХИВЕ НЕТ (секреты, лежат только на сервере в /root/expense_bot_test/)
-  settings.txt с настоящими ключами (токен Telegram, ключ Claude, ваш ID)
+ЧЕГО В АРХИВЕ НЕТ (секреты, лежат только на сервере в /root/expense_bot_deepseek/)
+  settings.txt с настоящими ключами (токен Telegram, ключ DeepSeek, ваш ID)
   credentials.json — ключ служебного аккаунта Google для таблицы
   Без них бот не запустится. Как сохранить их копию — ниже, «Резервная копия».
 
@@ -56,41 +67,41 @@
   bot.log хранится в трёх файлах по 5 МБ (bot.log, bot.log.1, bot.log.2), старое удаляется само.
 
 УСТАНОВКА НА НОВЫЙ СЕРВЕР (Ubuntu)
-  1. Скопируйте папку на сервер в /root/expense_bot_test/
+  1. Скопируйте папку на сервер в /root/expense_bot_deepseek/
      (на сервере: git clone АДРЕС_РЕПОЗИТОРИЯ /root/repo, затем
-      cp -r /root/repo/expense_bot /root/expense_bot_test, если папки ещё нет).
+      cp -r /root/repo/expense_bot /root/expense_bot_deepseek, если папки ещё нет).
      Если settings.txt на сервере ещё нет: cp settings.example.txt settings.txt и заполните.
   2. Положите туда settings.txt с ключами и credentials.json.
-  3. На сервере: cd /root/expense_bot_test && bash install_server.sh
+  3. На сервере: cd /root/expense_bot_deepseek && bash install_server.sh
 
 ОБНОВЛЕНИЕ КОДА
-  Замените файлы (все .py, requirements.txt, expense-bot-claude.service, install_server.sh)
-  и выполните: cd /root/expense_bot_test && bash install_server.sh
+  Замените файлы (все .py, requirements.txt, expense-bot-deepseek.service, install_server.sh)
+  и выполните: cd /root/expense_bot_deepseek && bash install_server.sh
   Скрипт доставит новые библиотеки, обновит службу и перезапустит бота.
   settings.txt и credentials.json при этом не трогайте (в репозитории их нет,
   поэтому копирование новых файлов поверх их не затрёт).
-  Если меняли только .py-файлы, достаточно: systemctl restart expense-bot-claude
+  Если меняли только .py-файлы, достаточно: systemctl restart expense-bot-deepseek
 
 ЗАЩИТА СЛУЖБЫ
-  Служба может писать только в /root/expense_bot_test (ProtectSystem=strict).
-  Если бот не стартует после обновления, посмотрите: journalctl -u expense-bot-claude -n 30
+  Служба может писать только в /root/expense_bot_deepseek (ProtectSystem=strict).
+  Если бот не стартует после обновления, посмотрите: journalctl -u expense-bot-deepseek -n 30
   Если папка бота на сервере другая, поправьте ReadWritePaths и пути в .service.
 
 ПРОВЕРКИ (для разработки)
   venv/bin/pip install pytest && venv/bin/python -m pytest -q tests
 
 ПОЛЕЗНЫЕ КОМАНДЫ (на сервере)
-  systemctl status expense-bot-claude     — работает ли бот
-  systemctl restart expense-bot-claude    — перезапуск
-  tail -50 /root/expense_bot_test/bot.log — последние записи журнала
+  systemctl status expense-bot-deepseek     — работает ли бот
+  systemctl restart expense-bot-deepseek    — перезапуск
+  tail -50 /root/expense_bot_deepseek/bot.log — последние записи журнала
 
-КЛЮЧ CLAUDE
-  У ключа есть срок действия (виден в Claude Console, «Ключи и доступ»).
-  Перед окончанием создайте новый и запишите его так (на сервере):
-    read -s -p "Ключ: " K; echo; sed -i "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=$K|" /root/expense_bot_test/settings.txt; unset K
-    systemctl restart expense-bot-claude
+КЛЮЧ DEEPSEEK
+  Ключ и баланс — на platform.deepseek.com. Если баланс закончится, бот напишет
+  «на балансе DeepSeek закончились средства». Заменить ключ (на сервере):
+    read -s -p "Ключ: " K; echo; sed -i "s|^DEEPSEEK_API_KEY=.*|DEEPSEEK_API_KEY=$K|" /root/expense_bot_deepseek/settings.txt; unset K
+    systemctl restart expense-bot-deepseek
   Затем /check в боте.
 
 РЕЗЕРВНАЯ КОПИЯ ВСЕГО С СЕРВЕРА (вместе с ключами), из Termux:
-  ssh root@АДРЕС "cd /root && tar czf - --exclude=venv --exclude=__pycache__ expense_bot_test" > ~/storage/downloads/expense_bot_backup.tar.gz
+  ssh root@АДРЕС "cd /root && tar czf - --exclude=venv --exclude=__pycache__ expense_bot_deepseek" > ~/storage/downloads/expense_bot_backup.tar.gz
   Этот файл содержит секретные ключи — храните его у себя, никому не пересылайте.

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
 import config
-from claude_parse import StatementOp
+from ai_parse import StatementOp
 
 log = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ IGNORED_KEEP_DAYS = 183        # «не нужно» старше полугод
 def op_key(op: StatementOp) -> str:
     """Ключ операции из выписки: дата, время и сумма.
 
-    Название получателя в ключ не входит: Claude может записать его по-разному
+    Название получателя в ключ не входит: модель может записать его по-разному
     («OZON» / «Ozon.ru»), и тогда отклонённая операция всплывала бы снова.
     Дата, время и сумма переписываются из выписки цифрами и не меняются.
     """

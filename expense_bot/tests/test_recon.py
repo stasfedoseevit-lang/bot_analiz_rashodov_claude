@@ -3,7 +3,7 @@ from datetime import datetime
 
 import config
 import recon
-from claude_parse import StatementOp
+from ai_parse import StatementOp
 
 
 def op(d, rub, merchant="x"):

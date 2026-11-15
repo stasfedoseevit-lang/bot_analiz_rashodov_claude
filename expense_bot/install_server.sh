@@ -2,7 +2,7 @@
 # Установка или переустановка бота на сервере (Ubuntu). Запуск: bash install_server.sh
 # Ничего не удаляет: settings.txt и credentials.json остаются как есть.
 set -e
-DIR=/root/expense_bot_test
+DIR=/root/expense_bot_deepseek
 cd "$DIR"
 
 if ! python3 -c "import ensurepip" 2>/dev/null; then
@@ -20,10 +20,10 @@ venv/bin/pip install "pillow-heif>=0.16" || echo "pillow-heif не устано�
 chmod 600 settings.txt
 [ -f credentials.json ] && chmod 600 credentials.json || echo "Внимание: нет credentials.json (нужен для Google Таблицы)."
 
-cp expense-bot-claude.service /etc/systemd/system/
+cp expense-bot-deepseek.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable expense-bot-claude
-systemctl restart expense-bot-claude
+systemctl enable expense-bot-deepseek
+systemctl restart expense-bot-deepseek
 sleep 3
-systemctl --no-pager status expense-bot-claude | head -5
+systemctl --no-pager status expense-bot-deepseek | head -5
 echo "Готово. Проверьте бота командой /check в Telegram."
