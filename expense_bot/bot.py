@@ -48,6 +48,8 @@ class Item:
     key: str = ""                  # для "op": ключ, по которому запоминаем «не нужно»
     force: bool = False            # не проверять на повтор (нажали «Всё равно внести»)
     raw: str = ""                  # для "op": что писать в колонку «Исходное»
+    queued: bool = False           # ждал в очереди (тогда при показе повторяем фото чека)
+    task: Optional["asyncio.Task"] = None   # фоновое распознавание (см. submit)
 
 
 @dataclass
@@ -89,6 +91,7 @@ class UserState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     recon: Optional[ReconState] = None
     dups: Dict[int, "Expense"] = field(default_factory=dict)   # пропущенные повторы (для «Всё равно внести»)
+    pump: Optional["asyncio.Task"] = None   # обработчик очереди (см. pump_queue)
 
 
 STATES: Dict[int, UserState] = {}
@@ -210,82 +213,172 @@ async def fetch_image(bot: Bot, file_id: str) -> bytes:
 
 
 # ---------------------------------------------------------------- основной поток
+#
+# Как идут чеки:
+#   1. submit() сразу запускает распознавание в фоне (Claude читает чек, пока вы отвечаете
+#      на вопросы по предыдущему) и кладёт чек в очередь.
+#   2. pump_queue() — один на пользователя. Когда текущей траты нет, он берёт первый чек
+#      из очереди, дожидается распознавания (уже без блокировки: кнопки и ответы работают)
+#      и показывает вопрос о категории.
+#   3. finalize() / «Не трата» освобождают место и снова будят pump_queue().
+
+RECOGNIZE_PARALLEL = 3          # сколько чеков одновременно читает Claude
+_recognize_sem: Optional[asyncio.Semaphore] = None
+
+
+def _recognize_limit() -> asyncio.Semaphore:
+    global _recognize_sem
+    if _recognize_sem is None:          # создаём внутри работающего цикла событий
+        _recognize_sem = asyncio.Semaphore(RECOGNIZE_PARALLEL)
+    return _recognize_sem
+
+
+@dataclass
+class Recognized:
+    parsed: ParsedExpense
+    raw: str                       # что писать в колонку «Исходное»
+    photo_id: Optional[str]
+    t_download: float = 0.0
+    t_ai: float = 0.0
+
 
 async def keep_typing(bot: Bot, chat_id: int) -> None:
     """Показывает «печатает…», пока идёт обработка (индикатор Telegram живёт около 5 секунд)."""
     try:
-        for _ in range(8):
+        for _ in range(75):     # не дольше 5 минут, даже если что-то зависло
             await bot.send_chat_action(chat_id, "typing")
             await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:  # noqa: BLE001
         log.debug("typing: %s", e)
 
 
-async def process_item(bot: Bot, st: UserState, item: Item, from_queue: bool = False) -> None:
-    chat_id = st.chat_id
-    t0 = time.monotonic()
-    t_download = 0.0
-    now = now_local()
-    photo_id = None
-    typing = asyncio.create_task(keep_typing(bot, chat_id))  # не задерживает основную работу
-    try:
-        if item.kind == "photo":
-            data = await fetch_image(bot, item.file_id)
-            t_download = time.monotonic() - t0
-            parsed = await read_expense(image_bytes=data, today=now)
-            raw, photo_id = "Скриншот", item.file_id
-        elif item.kind == "pdf":
-            data = await fetch_image(bot, item.file_id)
-            t_download = time.monotonic() - t0
-            parsed = await read_expense(pdf_bytes=data, today=now)
-            raw = f"PDF: {item.name}" if item.name else "PDF"
-        elif item.kind == "op":
-            parsed, raw = item.parsed, item.raw or "Из выписки"
-            photo_id = item.file_id
-        else:
-            parsed = await read_expense(text=item.text, today=now)
-            raw = item.text or ""
-    except Exception as e:  # noqa: BLE001
-        log.exception("Не удалось обработать чек")
-        parsed = ParsedExpense(error=friendly_error(e))
-        raw = {"photo": "Скриншот", "pdf": "PDF"}.get(item.kind, item.text or "")
-        photo_id = item.file_id if item.kind == "photo" else None
+async def recognize(bot: Bot, item: Item) -> Recognized:
+    """Скачивает чек и отдаёт его Claude. Ошибки не выбрасывает: они попадают в parsed.error."""
+    if item.kind == "op":
+        return Recognized(item.parsed, item.raw or "Из выписки", item.file_id)
+    async with _recognize_limit():
+        t0 = time.monotonic()
+        t_download = 0.0
+        now = now_local()
+        try:
+            if item.kind == "photo":
+                data = await fetch_image(bot, item.file_id)
+                t_download = time.monotonic() - t0
+                parsed = await read_expense(image_bytes=data, today=now)
+                raw, photo_id = "Скриншот", item.file_id
+            elif item.kind == "pdf":
+                data = await fetch_image(bot, item.file_id)
+                t_download = time.monotonic() - t0
+                parsed = await read_expense(pdf_bytes=data, today=now)
+                raw, photo_id = (f"PDF: {item.name}" if item.name else "PDF"), None
+            else:
+                parsed = await read_expense(text=item.text, today=now)
+                raw, photo_id = item.text or "", None
+        except Exception as e:  # noqa: BLE001
+            log.exception("Не удалось обработать чек")
+            parsed = ParsedExpense(error=friendly_error(e))
+            raw = {"photo": "Скриншот", "pdf": "PDF"}.get(item.kind, item.text or "")
+            photo_id = item.file_id if item.kind == "photo" else None
+        return Recognized(parsed, raw, photo_id, t_download, time.monotonic() - t0)
 
-    typing.cancel()
-    t_ai = time.monotonic() - t0
+
+def start_recognition(bot: Bot, item: Item) -> None:
+    if item.task is None:
+        item.task = asyncio.create_task(recognize(bot, item))
+
+
+def kick(bot: Bot, st: UserState) -> None:
+    """Будит обработчик очереди (если он уже работает, второй не запускается)."""
+    if st.pump is None or st.pump.done():
+        st.pump = asyncio.create_task(pump_queue(bot, st))
+
+
+def waiting_count(st: UserState) -> int:
+    """Сколько чеков ждут своей очереди (без того, что сейчас готовится к показу)."""
+    return len(st.queue) - (1 if st.current is None and st.queue else 0)
+
+
+async def submit(bot: Bot, st: UserState, item: Item) -> None:
+    """Принимает чек. Вызывается под st.lock и не ждёт Claude."""
+    start_recognition(bot, item)
+    busy = st.current is not None or bool(st.queue)
+    st.queue.append(item)
+    if busy:
+        item.queued = True
+        await bot.send_message(st.chat_id, f"📥 Добавлено в очередь. В очереди: {waiting_count(st)}")
+    kick(bot, st)
+
+
+async def pump_queue(bot: Bot, st: UserState) -> None:
+    try:
+        while True:
+            async with st.lock:
+                if st.current is not None or not st.queue:
+                    return
+                item = st.queue[0]
+                start_recognition(bot, item)
+            # Ждём Claude без блокировки: в это время работают кнопки, /cancel и приём новых чеков
+            typing = None if item.task.done() else asyncio.create_task(keep_typing(bot, st.chat_id))
+            try:
+                await asyncio.wait({item.task})
+            finally:
+                if typing is not None:
+                    typing.cancel()
+            if item.task.cancelled():
+                continue                     # очередь сбросили через /cancel
+            rec = item.task.result()
+            now = now_local()
+            dup = None
+            # Операции из сверки только что сравнили с таблицей: повторно не проверяем
+            if (rec.parsed.amount > 0 and plausible(rec.parsed.date, now)
+                    and not item.force and not item.key):
+                dup = await find_duplicate(rec.parsed.date, rec.parsed.amount)
+            async with st.lock:
+                if st.current is not None or not st.queue or st.queue[0] is not item:
+                    continue                 # пока ждали, очередь изменили
+                st.queue.popleft()
+                try:
+                    await present(bot, st, item, rec, dup, now)
+                except Exception:  # noqa: BLE001
+                    log.exception("Не удалось показать трату")
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        log.exception("Ошибка в обработке очереди")
+
+
+async def present(bot: Bot, st: UserState, item: Item, rec: Recognized, dup, now: datetime) -> None:
+    """Показывает распознанный чек: вопрос о категории, просьбу ввести сумму или «уже есть». Под st.lock."""
+    chat_id = st.chat_id
+    parsed = rec.parsed
     date = parsed.date if plausible(parsed.date, now) else now
     exp = Expense(
         eid=next(_eids), date=date, amount=parsed.amount, merchant=parsed.merchant,
-        bank=parsed.bank, raw=raw, photo_id=photo_id, skip_key=item.key,
+        bank=parsed.bank, raw=rec.raw, photo_id=rec.photo_id, skip_key=item.key,
     )
-
-    def log_times() -> None:
-        log.info("Время: скачивание %.1f с, Claude %.1f с, всего %.1f с",
-                 t_download, t_ai - t_download, time.monotonic() - t0)
+    if item.kind != "op":
+        log.info("Время: скачивание %.1f с, Claude %.1f с", rec.t_download, rec.t_ai - rec.t_download)
 
     # Повтор: такая же трата уже есть в таблице -> не спрашиваем, сообщаем и идём дальше
-    if exp.amount > 0 and plausible(parsed.date, now) and not item.force:
-        dup = await find_duplicate(exp)
-        if dup is not None:
-            st.current = None
-            st.dups[exp.eid] = exp
-            while len(st.dups) > 100:
-                st.dups.pop(next(iter(st.dups)))
-            d, rub, merchant = dup
-            await bot.send_message(
-                chat_id,
-                f"🔁 Уже есть в таблице: {d:%d.%m.%Y %H:%M} · {fmt_rub(rub / 1000)} · {esc(merchant)}. Пропускаю.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("➕ Всё равно внести", f"d:{exp.eid}")]]),
-            )
-            log.info("Повтор пропущен: %s %.2f %s", exp.date, exp.amount * 1000, exp.merchant)
-            log_times()
-            await start_next(bot, st)
-            return
+    if dup is not None:
+        st.dups[exp.eid] = exp
+        while len(st.dups) > 100:
+            st.dups.pop(next(iter(st.dups)))
+        d, rub, merchant = dup
+        await bot.send_message(
+            chat_id,
+            f"🔁 Уже есть в таблице: {d:%d.%m.%Y %H:%M} · {fmt_rub(rub / 1000)} · {esc(merchant)}. Пропускаю.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("➕ Всё равно внести", f"d:{exp.eid}")]]),
+        )
+        log.info("Повтор пропущен: %s %.2f %s", exp.date, exp.amount * 1000, exp.merchant)
+        return
 
     st.current = exp
-    if photo_id and from_queue:
+    if rec.photo_id and item.queued:
         # фото повторяем только для трат из очереди, чтобы было понятно, к какому чеку вопрос
-        await bot.send_photo(chat_id, photo_id, caption="📷 Чек")
+        await bot.send_photo(chat_id, rec.photo_id, caption="📷 Чек")
 
     if parsed.ops > 1:
         await bot.send_message(
@@ -299,33 +392,34 @@ async def process_item(bot: Bot, st: UserState, item: Item, from_queue: bool = F
         await bot.send_message(
             chat_id, f"⚠️ Не смог прочитать сумму{reason}.\n{AMOUNT_HINT}", reply_markup=amount_kb(exp)
         )
-        log_times()
         return
     await show_question(bot, st)
-    log_times()
 
 
 DUP_MINUTES = 10   # чек с временем: повтор, если время совпадает с точностью до 10 минут
 
 
-async def find_duplicate(exp: Expense):
-    """Ищет в таблице такую же трату: сумма до рубля и то же время (или тот же день, если времени нет)."""
+async def find_duplicate(date: datetime, amount: float):
+    """Ищет в таблице такую же трату: сумма до рубля и то же время (или тот же день, если времени нет).
+
+    amount — в тысячах рублей. Строки таблицы берутся из памяти хранилища, если они свежие.
+    """
     try:
         rows = await asyncio.to_thread(
-            get_storage().rows_between, exp.date - timedelta(days=1), exp.date + timedelta(days=1))
+            get_storage().rows_between, date - timedelta(days=1), date + timedelta(days=1))
     except Exception as e:  # noqa: BLE001
         log.warning("Проверка на повтор не удалась: %s", e)
         return None
-    rub = exp.amount * 1000
-    for d, amount, merchant in rows:
-        if abs(amount - rub) > 1.0:
+    rub = amount * 1000
+    for d, row_rub, merchant in rows:
+        if abs(row_rub - rub) > 1.0:
             continue
-        if (d.hour, d.minute) == (0, 0) or (exp.date.hour, exp.date.minute) == (0, 0):
-            same = d.date() == exp.date.date()
+        if (d.hour, d.minute) == (0, 0) or (date.hour, date.minute) == (0, 0):
+            same = d.date() == date.date()
         else:
-            same = abs(d - exp.date) <= timedelta(minutes=DUP_MINUTES)
+            same = abs(d - date) <= timedelta(minutes=DUP_MINUTES)
         if same:
-            return d, amount, merchant
+            return d, row_rub, merchant
     return None
 
 
@@ -333,19 +427,6 @@ async def show_question(bot: Bot, st: UserState) -> None:
     exp = st.current
     exp.stage = "category"
     await bot.send_message(st.chat_id, question_text(exp), reply_markup=main_kb(exp))
-
-
-async def submit(bot: Bot, st: UserState, item: Item) -> None:
-    if st.current is not None:
-        st.queue.append(item)
-        await bot.send_message(st.chat_id, f"📥 Добавлено в очередь. В очереди: {len(st.queue)}")
-        return
-    await process_item(bot, st, item)
-
-
-async def start_next(bot: Bot, st: UserState) -> None:
-    if st.queue:
-        await process_item(bot, st, st.queue.popleft(), from_queue=True)
 
 
 async def ask_comment_new(bot: Bot, st: UserState) -> None:
@@ -374,7 +455,7 @@ async def finalize(bot: Bot, st: UserState) -> None:
     if exp.category == WORK and exp.ref != "—":
         where += f" / {exp.ref}"
     await bot.send_message(st.chat_id, f"✅ <b>Записано:</b> {esc(where)} · {fmt_rub(exp.amount)}{note}")
-    await start_next(bot, st)
+    kick(bot, st)
 
 
 async def handle_answer(bot: Bot, st: UserState, text: str) -> None:
@@ -416,6 +497,9 @@ async def cmd_cancel(message: Message, bot: Bot) -> None:
     st = get_state(message.from_user.id, message.chat.id)
     async with st.lock:
         st.current = None
+        for item in st.queue:
+            if item.task is not None:
+                item.task.cancel()
         st.queue.clear()
         st.recon = None
     await bot.send_message(message.chat.id, "🔄 Очередь, текущая трата и сверка сброшены.")
@@ -591,7 +675,7 @@ async def run_reconcile(bot: Bot, st: UserState, rs: ReconState) -> None:
         start = min(o.date for o in ops) - timedelta(days=recon.DATE_TOLERANCE_DAYS)
         end = max(o.date for o in ops) + timedelta(days=recon.DATE_TOLERANCE_DAYS)
         try:
-            registry = await asyncio.to_thread(get_storage().rows_between, start, end)
+            registry = await asyncio.to_thread(get_storage().rows_between, start, end, True)
         except Exception as e:  # noqa: BLE001
             log.exception("Чтение реестра")
             st.recon = None
@@ -648,8 +732,7 @@ async def handle_pick(bot: Bot, st: UserState, text: str) -> None:
     tail = f" Остальные ({skipped}) больше спрашивать не буду." if skipped else ""
     await bot.send_message(st.chat_id, f"Вношу операций: {len(items)}. Категории спрошу по очереди.{tail}")
     st.queue.extend(items)
-    if st.current is None:
-        await start_next(bot, st)
+    kick(bot, st)
 
 
 @router.message(Command("reconcile"))
@@ -829,7 +912,7 @@ async def cb_cancel(call: CallbackQuery, bot: Bot) -> None:
             recon.add_ignored([exp.skip_key])   # операция из выписки: больше не спрашиваем
         await edit(bot, call.message, "🚫 Трата отменена.")
         await bot.answer_callback_query(call.id)
-        await start_next(bot, st)
+        kick(bot, st)
 
 
 # ---------------------------------------------------------------- запуск

@@ -2,6 +2,8 @@
 import csv
 import json
 import logging
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -73,7 +75,7 @@ class CsvStorage:
         self.path = Path(path)
         self.label = f"файл {self.path.name}"
 
-    def rows_between(self, start: datetime, end: datetime) -> List[tuple]:
+    def rows_between(self, start: datetime, end: datetime, fresh: bool = False) -> List[tuple]:
         if not self.path.exists():
             return []
         with open(self.path, encoding="utf-8-sig", newline="") as f:
@@ -90,11 +92,24 @@ class CsvStorage:
 
 
 class SheetsStorage:
+    """Google Таблица.
+
+    Чтобы не упираться в лимит Google (60 чтений в минуту) и не ждать сети на каждом чеке:
+    - листы ищутся один раз и запоминаются;
+    - строки месяца для проверки на повтор хранятся в памяти и дополняются при каждой записи,
+      а целиком перечитываются не чаще раза в ROWS_TTL секунд (вдруг таблицу правили вручную).
+    """
+
+    ROWS_TTL = 300   # секунд
+
     def __init__(self, credentials_file: Path, sheet_name: str):
         import gspread
 
         self._gspread = gspread
         self.label = f"Google Таблица «{sheet_name}»"
+        self._lock = threading.Lock()      # методы вызываются из разных потоков (asyncio.to_thread)
+        self._sheets = {}                  # название листа -> лист
+        self._rows = {}                    # название листа -> (когда прочитан, [(дата, рубли, получатель)])
         if not Path(credentials_file).exists():
             raise StorageError(
                 f"Не найден файл {Path(credentials_file).name} в папке бота. "
@@ -114,28 +129,75 @@ class SheetsStorage:
                 "Проверьте, что в Google Cloud включены Google Sheets API и Google Drive API."
             ) from None
 
-    def rows_between(self, start: datetime, end: datetime) -> List[tuple]:
+    def _worksheet(self, title: str, create: bool = False):
+        """Лист по названию (из памяти, если уже искали). None, если листа нет и create=False."""
+        with self._lock:
+            ws = self._sheets.get(title)
+        if ws is not None:
+            return ws
+        try:
+            ws = self.book.worksheet(title)
+        except self._gspread.exceptions.WorksheetNotFound:
+            if not create:
+                return None
+            ws = self.book.add_worksheet(title=title, rows=1000, cols=len(HEADER))
+            ws.append_row(HEADER)
+        with self._lock:
+            self._sheets[title] = ws
+        return ws
+
+    def _forget(self, title: str) -> None:
+        with self._lock:
+            self._sheets.pop(title, None)
+            self._rows.pop(title, None)
+
+    def _month_rows(self, title: str, fresh: bool) -> List[tuple]:
+        with self._lock:
+            cached = self._rows.get(title)
+        if cached is not None and not fresh and time.monotonic() - cached[0] < self.ROWS_TTL:
+            return cached[1]
+        ws = self._worksheet(title)
+        if ws is None:
+            rows = []      # листа нет: не запоминаем, чтобы заметить, когда его создадут вручную
+        else:
+            try:
+                values = ws.get_all_values()
+            except self._gspread.exceptions.APIError:
+                self._forget(title)   # лист могли удалить или переименовать: в следующий раз ищем заново
+                raise
+            rows = [p for p in (parse_registry_row(r) for r in values) if p]
+            with self._lock:
+                self._rows[title] = (time.monotonic(), rows)
+        return rows
+
+    def rows_between(self, start: datetime, end: datetime, fresh: bool = False) -> List[tuple]:
+        """Траты за период. fresh=True перечитывает таблицу (для сверки), иначе может взять из памяти."""
         found = []
         for month in _month_titles(start, end):
-            try:
-                ws = self.book.worksheet(month_title(month))
-            except self._gspread.exceptions.WorksheetNotFound:
-                continue
-            for r in ws.get_all_values():
-                p = parse_registry_row(r)
-                if p and start <= p[0] <= end:
-                    found.append(p)
+            found.extend(p for p in self._month_rows(month_title(month), fresh) if start <= p[0] <= end)
         return found
 
     def save(self, date: datetime, row: List) -> None:
         title = month_title(date)
+        ws = self._worksheet(title, create=True)
         try:
-            ws = self.book.worksheet(title)
-        except self._gspread.exceptions.WorksheetNotFound:
-            ws = self.book.add_worksheet(title=title, rows=1000, cols=len(HEADER))
-            ws.append_row(HEADER)
-        resp = ws.append_row(row)
+            resp = ws.append_row(row)
+        except self._gspread.exceptions.APIError as e:
+            # Лист могли удалить или переименовать, пока он был запомнен: Google отвечает 400/404,
+            # и строка точно не записана. Ищем лист заново и пробуем ещё раз. Другие ошибки
+            # (лимит, сбой Google) не повторяем, чтобы не получить две одинаковые строки.
+            self._forget(title)
+            if getattr(getattr(e, "response", None), "status_code", None) not in (400, 404):
+                raise
+            ws = self._worksheet(title, create=True)
+            resp = ws.append_row(row)
         self._verify(ws, title, row, resp)
+        parsed = parse_registry_row(row)
+        if parsed:
+            with self._lock:
+                cached = self._rows.get(title)
+                if cached is not None:
+                    cached[1].append(parsed)
 
     def _verify(self, ws, title: str, row: List, resp) -> None:
         """Перечитывает только что записанную строку: «Записано» только если она реально есть в таблице."""
