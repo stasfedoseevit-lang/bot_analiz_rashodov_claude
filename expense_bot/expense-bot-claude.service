@@ -9,6 +9,11 @@ ExecStart=/root/expense_bot_test/venv/bin/python bot.py
 Environment=PYTHONUTF8=1
 Restart=always
 RestartSec=10
+# Защита: бот может писать только в свою папку, без повышения прав
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/root/expense_bot_test
 
 [Install]
 WantedBy=multi-user.target
