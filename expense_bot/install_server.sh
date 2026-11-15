@@ -13,6 +13,8 @@ fi
 [ -d venv ] || python3 -m venv venv
 venv/bin/pip install --upgrade pip
 venv/bin/pip install -r requirements.txt
+# HEIC-фото с iPhone (необязательно: без этой библиотеки бот попросит прислать PNG или JPEG)
+venv/bin/pip install "pillow-heif>=0.16" || echo "pillow-heif не установился, HEIC-фото читаться не будут."
 
 [ -f settings.txt ] || { echo "Нет settings.txt: заполните его и запустите скрипт снова."; exit 1; }
 chmod 600 settings.txt

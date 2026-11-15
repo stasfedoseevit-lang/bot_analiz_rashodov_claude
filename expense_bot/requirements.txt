@@ -4,3 +4,4 @@ gspread>=6.0,<7
 python-dotenv>=1.0
 tzdata
 openpyxl>=3.1
+Pillow>=10

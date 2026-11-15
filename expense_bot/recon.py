@@ -1,8 +1,8 @@
 """Сверка выписок с реестром: какие операции из банка не внесены в таблицу."""
-import csv
 import io
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
@@ -11,12 +11,31 @@ from claude_parse import StatementOp
 
 log = logging.getLogger(__name__)
 
-AMOUNT_TOLERANCE_RUB = 1.0     # в таблице сумма хранится с точностью до рубля
+AMOUNT_TOLERANCE_RUB = 1.0     # допуск по сумме при сравнении с таблицей
 DATE_TOLERANCE_DAYS = 3        # в скриншоте дата операции, в выписке бывает дата проведения
+IGNORED_KEEP_DAYS = 183        # «не нужно» старше полугода забываем: такие выписки уже не сверяют
 
 
 def op_key(op: StatementOp) -> str:
-    return f"{op.date:%d.%m.%Y %H:%M}|{op.rub:.2f}|{op.merchant}"
+    """Ключ операции из выписки: дата, время и сумма.
+
+    Название получателя в ключ не входит: Claude может записать его по-разному
+    («OZON» / «Ozon.ru»), и тогда отклонённая операция всплывала бы снова.
+    Дата, время и сумма переписываются из выписки цифрами и не меняются.
+    """
+    return f"{op.date:%d.%m.%Y %H:%M}|{op.rub:.2f}"
+
+
+def _normalize_key(key: str) -> str:
+    """Старые ключи были вида «дата|сумма|получатель»: отбрасываем получателя."""
+    return "|".join(str(key).split("|")[:2])
+
+
+def _key_date(key: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(key.split("|")[0], "%d.%m.%Y %H:%M")
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------- «не нужно» (игнорируемые)
@@ -24,19 +43,23 @@ def op_key(op: StatementOp) -> str:
 def load_ignored() -> set:
     try:
         with open(config.IGNORED_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
-    except (OSError, ValueError):
+            return {_normalize_key(k) for k in json.load(f)}
+    except (OSError, ValueError, TypeError):
         return set()
 
 
-def add_ignored(keys) -> None:
-    keys = set(keys)
+def add_ignored(keys, now: Optional[datetime] = None) -> None:
+    keys = {_normalize_key(k) for k in keys}
     if not keys:
         return
-    all_keys = load_ignored() | keys
+    now = now or datetime.now()
+    oldest = now - timedelta(days=IGNORED_KEEP_DAYS)
+    all_keys = {k for k in load_ignored() | keys if (_key_date(k) or now) >= oldest}
+    tmp = config.IGNORED_FILE.with_suffix(".tmp")
     try:
-        with open(config.IGNORED_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(sorted(all_keys), f, ensure_ascii=False, indent=0)
+        os.replace(tmp, config.IGNORED_FILE)
     except OSError as e:
         log.warning("Не удалось сохранить список игнорируемых операций: %s", e)
 

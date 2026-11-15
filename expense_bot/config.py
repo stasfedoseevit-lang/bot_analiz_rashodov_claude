@@ -6,7 +6,8 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = BASE_DIR / "settings.txt"
-if not SETTINGS_FILE.exists():
+# Значения можно задать и переменными окружения (так запускаются тесты); иначе нужен settings.txt
+if not SETTINGS_FILE.exists() and not os.getenv("TELEGRAM_TOKEN"):
     raise SystemExit(
         "Нет файла settings.txt. Скопируйте settings.example.txt в settings.txt "
         "и впишите в него ключи."
@@ -53,6 +54,7 @@ try:
 except ValueError:
     raise SystemExit("В settings.txt поля RECON_WEEKDAY и RECON_HOUR должны быть числами.")
 IGNORED_FILE = BASE_DIR / "ignored_ops.json"
+STATE_FILE = BASE_DIR / "state.json"      # незаконченная трата, очередь и сверка (между перезапусками)
 
 if STORAGE not in ("csv", "sheets"):
     raise SystemExit("В settings.txt поле STORAGE должно быть csv или sheets.")

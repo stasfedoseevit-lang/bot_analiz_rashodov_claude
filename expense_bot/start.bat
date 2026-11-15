@@ -44,6 +44,7 @@ pause
 exit /b 1
 
 :run
+pip install "pillow-heif>=0.16" --default-timeout=20 --retries=1 >nul 2>nul
 python bot.py
 echo.
 echo Бот остановлен.

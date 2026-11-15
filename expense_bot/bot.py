@@ -1,14 +1,16 @@
 """Telegram-бот учёта трат: скриншот или текст -> Claude читает сумму -> вы выбираете категорию -> запись."""
 import asyncio
 import html
-import itertools
+import json
 import logging
+import os
 import socket
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
-from typing import Deque, Dict, List, Optional
+from logging.handlers import RotatingFileHandler
+from typing import Deque, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -22,8 +24,10 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 import config
 import recon
 from categories import CATEGORIES, OTHER, WORK
-from claude_parse import ParsedExpense, friendly_error, read_expense, read_statement
-from storage import get_storage, save_fallback
+from claude_parse import (
+    AMOUNT_DIGITS, ParsedExpense, StatementOp, friendly_error, read_expense, read_statement, rub_to_thousands,
+)
+from storage import flush_fallback, get_storage, normalize_merchant, save_fallback
 
 log = logging.getLogger("expense_bot")
 
@@ -67,6 +71,7 @@ class Expense:
     comment: str = ""
     stage: str = "category"        # category | sub | amount | object | refine | comment
     skip_key: str = ""             # для трат из выписки
+    hint: Optional[Tuple[str, str, str]] = None   # подсказка: категория, подкатегория, уточнение
 
 
 @dataclass
@@ -92,10 +97,17 @@ class UserState:
     recon: Optional[ReconState] = None
     dups: Dict[int, "Expense"] = field(default_factory=dict)   # пропущенные повторы (для «Всё равно внести»)
     pump: Optional["asyncio.Task"] = None   # обработчик очереди (см. pump_queue)
+    saved: Dict[int, tuple] = field(default_factory=dict)      # последние записи (для «Отменить запись»)
 
 
 STATES: Dict[int, UserState] = {}
-_eids = itertools.count(1)
+_last_eid = 0      # номер последней траты (в кнопках); сохраняется между перезапусками
+
+
+def new_eid() -> int:
+    global _last_eid
+    _last_eid += 1
+    return _last_eid
 
 
 def get_state(user_id: int, chat_id: int) -> UserState:
@@ -138,7 +150,7 @@ def parse_amount_input(text: str) -> Optional[float]:
         return None
     if value <= 0:
         return None
-    return round(value if thousands else value / 1000.0, 3)
+    return round(value if thousands else value / 1000.0, AMOUNT_DIGITS)
 
 
 def plausible(date: Optional[datetime], now: datetime) -> bool:
@@ -166,8 +178,30 @@ def _grid(buttons, per_row=2):
     return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
 
 
+def hint_label(hint: Tuple[str, str, str]) -> str:
+    cat, sub, ref = hint
+    parts = [cat] + [p for p in (sub, ref) if p and p != "—"]
+    label = " / ".join(parts)
+    return label if len(label) <= 40 else label[:39] + "…"
+
+
+def valid_hint(hint) -> Optional[Tuple[str, str, str]]:
+    """Подсказка из таблицы, если такая категория и подкатегория ещё есть в боте."""
+    if not hint:
+        return None
+    cat, sub, ref = (str(x or "").strip() for x in hint)
+    if cat == WORK:
+        return (cat, "—", ref or "—")
+    if cat in CATEGORIES and sub in CATEGORIES[cat]:
+        return (cat, sub, (ref or "—") if sub == OTHER else "—")
+    return None
+
+
 def main_kb(exp: Expense) -> InlineKeyboardMarkup:
-    rows = _grid([_btn(cat, f"c:{exp.eid}:{i}") for i, cat in enumerate(CATS)])
+    rows = []
+    if exp.hint:
+        rows.append([_btn(f"⭐ {hint_label(exp.hint)}", f"h:{exp.eid}")])
+    rows += _grid([_btn(cat, f"c:{exp.eid}:{i}") for i, cat in enumerate(CATS)])
     rows.append([_btn("✏️ Изменить сумму", f"e:{exp.eid}")])
     rows.append([_btn("❌ Не трата", f"x:{exp.eid}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -335,12 +369,13 @@ async def pump_queue(bot: Bot, st: UserState) -> None:
             if (rec.parsed.amount > 0 and plausible(rec.parsed.date, now)
                     and not item.force and not item.key):
                 dup = await find_duplicate(rec.parsed.date, rec.parsed.amount)
+            hint = None if dup is not None else await find_hint(rec.parsed.merchant, now)
             async with st.lock:
                 if st.current is not None or not st.queue or st.queue[0] is not item:
                     continue                 # пока ждали, очередь изменили
                 st.queue.popleft()
                 try:
-                    await present(bot, st, item, rec, dup, now)
+                    await present(bot, st, item, rec, dup, now, hint)
                 except Exception:  # noqa: BLE001
                     log.exception("Не удалось показать трату")
     except asyncio.CancelledError:
@@ -349,14 +384,15 @@ async def pump_queue(bot: Bot, st: UserState) -> None:
         log.exception("Ошибка в обработке очереди")
 
 
-async def present(bot: Bot, st: UserState, item: Item, rec: Recognized, dup, now: datetime) -> None:
+async def present(bot: Bot, st: UserState, item: Item, rec: Recognized, dup, now: datetime,
+                  hint: Optional[Tuple[str, str, str]] = None) -> None:
     """Показывает распознанный чек: вопрос о категории, просьбу ввести сумму или «уже есть». Под st.lock."""
     chat_id = st.chat_id
     parsed = rec.parsed
     date = parsed.date if plausible(parsed.date, now) else now
     exp = Expense(
-        eid=next(_eids), date=date, amount=parsed.amount, merchant=parsed.merchant,
-        bank=parsed.bank, raw=rec.raw, photo_id=rec.photo_id, skip_key=item.key,
+        eid=new_eid(), date=date, amount=parsed.amount, merchant=parsed.merchant,
+        bank=parsed.bank, raw=rec.raw, photo_id=rec.photo_id, skip_key=item.key, hint=hint,
     )
     if item.kind != "op":
         log.info("Время: скачивание %.1f с, Claude %.1f с", rec.t_download, rec.t_ai - rec.t_download)
@@ -411,16 +447,29 @@ async def find_duplicate(date: datetime, amount: float):
         log.warning("Проверка на повтор не удалась: %s", e)
         return None
     rub = amount * 1000
-    for d, row_rub, merchant in rows:
-        if abs(row_rub - rub) > 1.0:
+    for r in rows:
+        if abs(r.rub - rub) > 1.0:
             continue
-        if (d.hour, d.minute) == (0, 0) or (date.hour, date.minute) == (0, 0):
-            same = d.date() == date.date()
+        if (r.date.hour, r.date.minute) == (0, 0) or (date.hour, date.minute) == (0, 0):
+            same = r.date.date() == date.date()
         else:
-            same = abs(d - date) <= timedelta(minutes=DUP_MINUTES)
+            same = abs(r.date - date) <= timedelta(minutes=DUP_MINUTES)
         if same:
-            return d, row_rub, merchant
+            return r.date, r.rub, r.merchant
     return None
+
+
+async def find_hint(merchant: str, now: datetime) -> Optional[Tuple[str, str, str]]:
+    """Категория, которую выбирали для этого получателя в прошлый раз (за последние ~3 месяца)."""
+    key = normalize_merchant(merchant)
+    if not key:
+        return None
+    try:
+        hints = await asyncio.to_thread(get_storage().category_hints, now)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Подсказка категории не удалась: %s", e)
+        return None
+    return valid_hint(hints.get(key))
 
 
 async def show_question(bot: Bot, st: UserState) -> None:
@@ -436,26 +485,66 @@ async def ask_comment_new(bot: Bot, st: UserState) -> None:
                            reply_markup=skip_back_kb(exp))
 
 
+SAVED_KEEP = 20    # сколько последних записей можно отменить кнопкой
+
+
 async def finalize(bot: Bot, st: UserState) -> None:
     exp = st.current
     row = [
         exp.date.strftime("%d.%m.%Y %H:%M"), exp.amount, exp.merchant, exp.category,
         exp.sub, exp.ref, exp.comment, exp.raw, exp.bank,
     ]
-    note = ""
+    note, ref = "", None
     try:
-        await asyncio.to_thread(get_storage().save, exp.date, row)
+        ref = await asyncio.to_thread(get_storage().save, exp.date, row)
     except Exception as e:  # noqa: BLE001
         log.exception("Ошибка записи")
         save_fallback(exp.date, row)
         note = (f"\n⚠️ Таблица недоступна ({esc(str(e)[:100])}). "
-                f"Строка сохранена в файл unsaved_expenses.csv")
+                f"Строка сохранена в файл unsaved_expenses.csv и будет дописана в таблицу, "
+                f"когда она снова заработает")
     st.current = None
     where = exp.category + (f" / {exp.sub}" if exp.sub not in ("—", "") else "")
     if exp.category == WORK and exp.ref != "—":
         where += f" / {exp.ref}"
-    await bot.send_message(st.chat_id, f"✅ <b>Записано:</b> {esc(where)} · {fmt_rub(exp.amount)}{note}")
+    kb = None
+    if ref is not None:
+        st.saved[exp.eid] = (ref, row, where, exp.amount)
+        while len(st.saved) > SAVED_KEEP:
+            st.saved.pop(next(iter(st.saved)))
+        kb = InlineKeyboardMarkup(inline_keyboard=[[_btn("↩️ Отменить запись", f"u:{exp.eid}")]])
+        schedule_flush(bot)
+    await bot.send_message(st.chat_id, f"✅ <b>Записано:</b> {esc(where)} · {fmt_rub(exp.amount)}{note}",
+                           reply_markup=kb)
     kick(bot, st)
+
+
+_flush_task: Optional["asyncio.Task"] = None
+
+
+def schedule_flush(bot: Bot) -> None:
+    """Если есть строки, не записанные из-за сбоя таблицы, дописывает их в фоне."""
+    global _flush_task
+    if not config.FALLBACK_FILE.exists():
+        return
+    if _flush_task is None or _flush_task.done():
+        _flush_task = asyncio.create_task(flush_unsaved(bot))
+
+
+async def flush_unsaved(bot: Bot) -> None:
+    try:
+        moved, left = await asyncio.to_thread(flush_fallback, get_storage())
+    except Exception:  # noqa: BLE001
+        log.exception("Перенос unsaved_expenses.csv")
+        return
+    if not moved:
+        return
+    tail = f" Осталось: {left}, попробую ещё раз позже." if left else ""
+    for uid in config.ALLOWED_USER_IDS:
+        try:
+            await bot.send_message(uid, f"📤 Дописал в таблицу строки, которые не удалось записать раньше: {moved}.{tail}")
+        except Exception as e:  # noqa: BLE001
+            log.warning("Не удалось сообщить о переносе: %s", e)
 
 
 async def handle_answer(bot: Bot, st: UserState, text: str) -> None:
@@ -478,18 +567,30 @@ async def handle_answer(bot: Bot, st: UserState, text: str) -> None:
 
 # ---------------------------------------------------------------- команды
 
-WELCOME = (
-    "Привет! Пришли скриншот траты (фото или файлом), PDF-чек или текст СМС, и я прочитаю сумму и магазин. "
-    "Потом выберешь категорию.\n\n"
-    "/reconcile — сверка с банковскими выписками (сама напоминает по понедельникам в 15:00)\n"
-    "/cancel — сбросить текущую трату, очередь и сверку\n"
-    "/check — проверить связь с Claude и таблицей"
-)
+WEEKDAYS_DAT = ["понедельникам", "вторникам", "средам", "четвергам", "пятницам", "субботам", "воскресеньям"]
+MONTHS_RU = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+             "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+
+
+def welcome_text() -> str:
+    if config.RECON_ENABLED:
+        when = f"сама напоминает по {WEEKDAYS_DAT[config.RECON_WEEKDAY % 7]} в {config.RECON_HOUR}:00"
+        recon_line = f"/reconcile — сверка с банковскими выписками ({when})\n"
+    else:
+        recon_line = "/reconcile — сверка с банковскими выписками\n"
+    return (
+        "Привет! Пришли скриншот траты (фото или файлом), PDF-чек или текст СМС, и я прочитаю сумму и магазин. "
+        "Потом выберешь категорию (⭐ — как в прошлый раз у этого получателя).\n\n"
+        + recon_line +
+        "/stats — траты за месяц по категориям (/stats 10 — за октябрь)\n"
+        "/cancel — сбросить текущую трату, очередь и сверку\n"
+        "/check — проверить связь с Claude и таблицей"
+    )
 
 
 @router.message(Command("start", "help"))
 async def cmd_start(message: Message, bot: Bot) -> None:
-    await bot.send_message(message.chat.id, WELCOME)
+    await bot.send_message(message.chat.id, welcome_text())
 
 
 @router.message(Command("cancel"))
@@ -503,6 +604,62 @@ async def cmd_cancel(message: Message, bot: Bot) -> None:
         st.queue.clear()
         st.recon = None
     await bot.send_message(message.chat.id, "🔄 Очередь, текущая трата и сверка сброшены.")
+
+
+def stats_month(arg: str, now: datetime) -> Optional[datetime]:
+    """«» -> текущий месяц, «10» -> октябрь (последний прошедший), «10.2025» -> октябрь 2025."""
+    arg = arg.strip()
+    if not arg:
+        return datetime(now.year, now.month, 1)
+    try:
+        if "." in arg:
+            m, y = arg.split(".", 1)
+            month, year = int(m), int(y)
+        else:
+            month, year = int(arg), now.year
+            if month > now.month:
+                year -= 1
+    except ValueError:
+        return None
+    if not 1 <= month <= 12 or year < 2000:
+        return None
+    return datetime(year, month, 1)
+
+
+def stats_text(month: datetime, records) -> str:
+    title = f"{MONTHS_RU[month.month - 1]} {month.year}"
+    if not records:
+        return f"📊 {title}: трат пока нет."
+    total = sum(r.rub for r in records)
+    by_cat: Dict[str, Dict[str, float]] = {}
+    for r in records:
+        cat = r.category or "Без категории"
+        sub = r.sub if r.sub and r.sub != "—" else ""
+        by_cat.setdefault(cat, {}).setdefault(sub, 0.0)
+        by_cat[cat][sub] += r.rub
+    lines = [f"📊 <b>{esc(title)}</b>: {fmt_rub(total / 1000)} ({len(records)} трат)", ""]
+    for cat, subs in sorted(by_cat.items(), key=lambda kv: -sum(kv[1].values())):
+        lines.append(f"<b>{esc(cat)}</b> — {fmt_rub(sum(subs.values()) / 1000)}")
+        for sub, rub in sorted(subs.items(), key=lambda kv: -kv[1]):
+            if sub and len(subs) > 1:
+                lines.append(f"   · {esc(sub)} — {fmt_rub(rub / 1000)}")
+    return "\n".join(lines)
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message, bot: Bot) -> None:
+    arg = (message.text or "").split(maxsplit=1)
+    month = stats_month(arg[1] if len(arg) > 1 else "", now_local())
+    if month is None:
+        await bot.send_message(message.chat.id, "Не понял месяц. Примеры: /stats, /stats 10, /stats 10.2025")
+        return
+    try:
+        records = await asyncio.to_thread(get_storage().month_records, month)
+    except Exception as e:  # noqa: BLE001
+        log.exception("Итоги месяца")
+        await bot.send_message(message.chat.id, f"❌ Не смог прочитать таблицу: {esc(str(e)[:200])}")
+        return
+    await send_chunks(bot, message.chat.id, stats_text(month, records).split("\n"))
 
 
 @router.message(Command("check"))
@@ -628,29 +785,29 @@ async def send_chunks(bot: Bot, chat_id: int, lines: List[str], limit: int = 350
         await bot.send_message(chat_id, buf)
 
 
-async def read_recon_files(bot: Bot, rs: ReconState, now: datetime):
-    """Читает все файлы выписок. Возвращает (операции, замечания по файлам)."""
+async def read_one_statement(bot: Bot, f: ReconFile, now: datetime):
+    data = await fetch_image(bot, f.file_id)
+    if f.kind == "pdf":
+        return await read_statement(pdf_bytes=data, today=now)
+    if f.kind == "csv":
+        text = recon.csv_to_text(data)
+    else:
+        text = await asyncio.to_thread(recon.xlsx_to_text, data)
+    return await read_statement(text=text, today=now)
+
+
+async def read_recon_files(bot: Bot, files: List[ReconFile], now: datetime):
+    """Читает все файлы выписок одновременно. Возвращает (операции, замечания по файлам)."""
+    results = await asyncio.gather(*(read_one_statement(bot, f, now) for f in files), return_exceptions=True)
     ops, problems, seen = [], [], set()
-    for f in rs.files:
-        try:
-            data = await fetch_image(bot, f.file_id)
-            if f.kind == "pdf":
-                res = await read_statement(pdf_bytes=data, today=now)
-            else:
-                if f.kind == "csv":
-                    text = recon.csv_to_text(data)
-                else:
-                    text = await asyncio.to_thread(recon.xlsx_to_text, data)
-                res = await read_statement(text=text, today=now)
-        except Exception as e:  # noqa: BLE001
-            log.exception("Выписка %s", f.name)
-            problems.append(f"{f.name}: {str(e)[:120]}")
+    for f, res in zip(files, results):
+        if isinstance(res, BaseException):
+            log.error("Выписка %s: %s", f.name, res)
+            problems.append(f"{f.name}: {friendly_error(res) if isinstance(res, Exception) else 'прервано'}")
             continue
         if res.error:
             problems.append(f"{f.name}: {res.error}")
             continue
-        if res.truncated:
-            problems.append(f"{f.name}: выписка слишком длинная, прочитана не до конца. Пришли её по частям (по неделям)")
         if not res.ops:
             problems.append(f"{f.name}: расходных операций не нашёл")
         # одна и та же операция в двух файлах (выписки пересекаются) считается один раз
@@ -660,51 +817,63 @@ async def read_recon_files(bot: Bot, rs: ReconState, now: datetime):
 
 
 async def run_reconcile(bot: Bot, st: UserState, rs: ReconState) -> None:
+    """Читает выписки и сравнивает с таблицей. Работает без блокировки (это долго),
+    поэтому состояние меняет только под st.lock и только если сверку за это время не отменили."""
     chat_id = st.chat_id
     await bot.send_message(chat_id, f"⏳ Читаю выписки (файлов: {len(rs.files)}). Это может занять пару минут.")
     typing = asyncio.create_task(keep_typing(bot, chat_id))
     try:
         now = now_local()
-        ops, problems = await read_recon_files(bot, rs, now)
+        ops, problems = await read_recon_files(bot, list(rs.files), now)
         warn = ("\n⚠️ " + "\n⚠️ ".join(esc(p) for p in problems)) if problems else ""
-        if not ops:
-            rs.stage, rs.files = "collect", []
-            await bot.send_message(chat_id, "Не нашёл ни одной расходной операции." + warn +
-                                   "\nМожно прислать другие файлы.", reply_markup=recon_kb())
-            return
-        start = min(o.date for o in ops) - timedelta(days=recon.DATE_TOLERANCE_DAYS)
-        end = max(o.date for o in ops) + timedelta(days=recon.DATE_TOLERANCE_DAYS)
-        try:
-            registry = await asyncio.to_thread(get_storage().rows_between, start, end, True)
-        except Exception as e:  # noqa: BLE001
-            log.exception("Чтение реестра")
-            st.recon = None
-            await bot.send_message(chat_id, f"❌ Не смог прочитать таблицу: {esc(str(e)[:200])}")
-            return
-        missing, matched = recon.find_missing(ops, registry)
-        ignored = recon.load_ignored()
-        fresh = [o for o in missing if recon.op_key(o) not in ignored]
-        header = (f"Нашёл в выписках расходов: {len(ops)}. Уже в таблице: {matched}. "
-                  f"Не нашёл в таблице: {len(fresh)}"
-                  + (f" (ещё {len(missing) - len(fresh)} ты раньше отклонил)" if len(missing) != len(fresh) else "")
-                  + "." + warn)
-        if not fresh:
-            st.recon = None
-            await bot.send_message(chat_id, "✅ " + header + "\nВсё сходится.")
-            return
-        rs.missing, rs.stage = fresh, "pick"
-        lines = [header, ""]
-        for i, o in enumerate(fresh, 1):
-            bank = f" ({esc(o.bank)})" if o.bank else ""
-            lines.append(f"{i}. {o.date:%d.%m %H:%M} · <b>{fmt_rub(o.rub / 1000)}</b> · {esc(o.merchant)}{bank}")
-        await send_chunks(bot, chat_id, lines)
-        await bot.send_message(
-            chat_id,
-            "Какие из них внести? Напиши номера (например <code>1,3,5</code> или <code>2-4</code>), "
-            "<code>все</code> или <code>нет</code>. Остальные запомню как «не нужно» и спрашивать больше не буду.")
+        registry, registry_error = [], None
+        if ops:
+            start = min(o.date for o in ops) - timedelta(days=recon.DATE_TOLERANCE_DAYS)
+            end = max(o.date for o in ops) + timedelta(days=recon.DATE_TOLERANCE_DAYS)
+            try:
+                registry = await asyncio.to_thread(get_storage().rows_between, start, end, True)
+            except Exception as e:  # noqa: BLE001
+                log.exception("Чтение реестра")
+                registry_error = e
+        async with st.lock:
+            if st.recon is not rs:
+                log.info("Сверку отменили, пока читались выписки: результат не показываю")
+                return
+            if not ops:
+                rs.stage, rs.files = "collect", []
+                await bot.send_message(chat_id, "Не нашёл ни одной расходной операции." + warn +
+                                       "\nМожно прислать другие файлы.", reply_markup=recon_kb())
+                return
+            if registry_error is not None:
+                st.recon = None
+                await bot.send_message(chat_id, f"❌ Не смог прочитать таблицу: {esc(str(registry_error)[:200])}")
+                return
+            missing, matched = recon.find_missing(ops, registry)
+            ignored = recon.load_ignored()
+            fresh = [o for o in missing if recon.op_key(o) not in ignored]
+            header = (f"Нашёл в выписках расходов: {len(ops)}. Уже в таблице: {matched}. "
+                      f"Не нашёл в таблице: {len(fresh)}"
+                      + (f" (ещё {len(missing) - len(fresh)} ты раньше отклонил)" if len(missing) != len(fresh) else "")
+                      + "." + warn)
+            if not fresh:
+                st.recon = None
+                await bot.send_message(chat_id, "✅ " + header + "\nВсё сходится.")
+                return
+            rs.missing, rs.stage = fresh, "pick"
+            lines = [header, ""]
+            for i, o in enumerate(fresh, 1):
+                bank = f" ({esc(o.bank)})" if o.bank else ""
+                lines.append(f"{i}. {o.date:%d.%m %H:%M} · <b>{fmt_rub(o.rub / 1000)}</b> · {esc(o.merchant)}{bank}")
+            await send_chunks(bot, chat_id, lines)
+            await bot.send_message(
+                chat_id,
+                "Какие из них внести? Напиши номера (например <code>1,3,5</code> или <code>2-4</code>), "
+                "<code>все</code> или <code>нет</code>. Остальные запомню как «не нужно» и спрашивать больше не буду.")
     except Exception as e:  # noqa: BLE001
         log.exception("Сверка")
-        st.recon = None
+        async with st.lock:
+            if st.recon is rs:
+                st.recon = None
         await bot.send_message(chat_id, f"❌ Сверка не удалась: {esc(str(e)[:200])}")
     finally:
         typing.cancel()
@@ -721,7 +890,7 @@ async def handle_pick(bot: Bot, st: UserState, text: str) -> None:
     recon.add_ignored(recon.op_key(o) for i, o in enumerate(rs.missing) if i not in chosen)
     items = [
         Item("op", key=recon.op_key(o),
-             parsed=ParsedExpense(amount=round(o.rub / 1000.0, 3), merchant=o.merchant, bank=o.bank, date=o.date))
+             parsed=ParsedExpense(amount=rub_to_thousands(o.rub), merchant=o.merchant, bank=o.bank, date=o.date))
         for i, o in enumerate(rs.missing) if i in chosen
     ]
     skipped = len(rs.missing) - len(items)
@@ -775,21 +944,34 @@ def next_recon_time(now: datetime) -> datetime:
     return target
 
 
+RECON_CHECK_EVERY = 600          # секунд: как часто сверяем часы
+RECON_LATE_LIMIT = timedelta(hours=12)   # если компьютер спал дольше, напоминание уже не к месту
+
+
 async def weekly_loop(bot: Bot) -> None:
-    """Раз в неделю сам просит выписки."""
+    """Раз в неделю сам просит выписки.
+
+    Не засыпает на неделю целиком, а проверяет время каждые 10 минут: если компьютер
+    уходил в сон или переводили часы, напоминание всё равно придёт вовремя (или чуть позже)."""
+    target = next_recon_time(now_local())
+    log.info("Следующее напоминание о сверке: %s", target.strftime("%d.%m.%Y %H:%M"))
     while True:
         now = now_local()
-        target = next_recon_time(now)
+        if now < target:
+            await asyncio.sleep(min(RECON_CHECK_EVERY, max(1.0, (target - now).total_seconds())))
+            continue
+        if now - target <= RECON_LATE_LIMIT:
+            for uid in config.ALLOWED_USER_IDS:
+                try:
+                    st = get_state(uid, uid)
+                    async with st.lock:
+                        await start_recon(bot, st)
+                except Exception:  # noqa: BLE001
+                    log.exception("Не удалось отправить напоминание о сверке")
+        else:
+            log.info("Напоминание о сверке пропущено: бот не работал в %s", target.strftime("%d.%m.%Y %H:%M"))
+        target = next_recon_time(now + timedelta(minutes=1))
         log.info("Следующее напоминание о сверке: %s", target.strftime("%d.%m.%Y %H:%M"))
-        await asyncio.sleep((target - now).total_seconds())
-        for uid in config.ALLOWED_USER_IDS:
-            try:
-                st = get_state(uid, uid)
-                async with st.lock:
-                    await start_recon(bot, st)
-            except Exception:  # noqa: BLE001
-                log.exception("Не удалось отправить напоминание о сверке")
-        await asyncio.sleep(60)
 
 
 # ---------------------------------------------------------------- кнопки
@@ -900,6 +1082,55 @@ async def cb_dup_add(call: CallbackQuery, bot: Bot) -> None:
         await submit(bot, st, item)
 
 
+@router.callback_query(F.data.startswith("h:"))
+async def cb_hint(call: CallbackQuery, bot: Bot) -> None:
+    """«⭐ Как в прошлый раз»: категория, подкатегория и уточнение одной кнопкой, дальше — комментарий."""
+    st = get_state(call.from_user.id, call.message.chat.id)
+    async with st.lock:
+        exp = await _current(bot, call, st)
+        if exp is None:
+            return
+        if not exp.hint:
+            await bot.answer_callback_query(call.id)
+            return
+        exp.category, exp.sub, exp.ref = exp.hint
+        exp.stage = "comment"
+        await edit(bot, call.message,
+                   f"⭐ <b>{esc(hint_label(exp.hint))}</b> · {fmt_rub(exp.amount)}\n"
+                   "💬 Напиши комментарий к трате (или «-», чтобы пропустить):", skip_back_kb(exp))
+        await bot.answer_callback_query(call.id)
+
+
+@router.callback_query(F.data.startswith("u:"))
+async def cb_undo(call: CallbackQuery, bot: Bot) -> None:
+    """«↩️ Отменить запись»: удаляет строку из таблицы, если на её месте всё ещё она."""
+    st = get_state(call.from_user.id, call.message.chat.id)
+    async with st.lock:
+        try:
+            saved = st.saved.pop(int(call.data.split(":")[1]), None)
+        except ValueError:
+            saved = None
+        await bot.answer_callback_query(call.id)
+        if saved is None:
+            await edit(bot, call.message, "⚠️ Эту запись уже нельзя отменить кнопкой. Удалите строку в таблице вручную.")
+            return
+        ref, row, where, amount = saved
+        try:
+            ok = await asyncio.to_thread(get_storage().delete, ref, row)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Отмена записи")
+            st.saved[int(call.data.split(":")[1])] = saved     # можно попробовать ещё раз
+            await bot.send_message(st.chat_id, f"❌ Не получилось отменить: {esc(str(e)[:150])}. Попробуйте ещё раз.")
+            return
+        if ok:
+            log.info("Запись отменена: %s %s", row[0], row[2])
+            await edit(bot, call.message, f"↩️ Запись отменена: {esc(where)} · {fmt_rub(amount)}")
+        else:
+            await edit(bot, call.message,
+                       f"⚠️ Не нашёл эту строку на прежнем месте (таблицу меняли). "
+                       f"Удалите вручную: {esc(row[0])} · {fmt_rub(amount)} · {esc(row[2])}")
+
+
 @router.callback_query(F.data.startswith("x:"))
 async def cb_cancel(call: CallbackQuery, bot: Bot) -> None:
     st = get_state(call.from_user.id, call.message.chat.id)
@@ -913,6 +1144,187 @@ async def cb_cancel(call: CallbackQuery, bot: Bot) -> None:
         await edit(bot, call.message, "🚫 Трата отменена.")
         await bot.answer_callback_query(call.id)
         kick(bot, st)
+
+
+# ---------------------------------------------------------------- сохранение состояния
+#
+# Текущая трата, очередь, сверка и последние записи раз в пару секунд (если что-то изменилось)
+# пишутся в state.json. После перезапуска бот продолжает с того же места, а кнопки
+# в старых сообщениях продолжают работать (номера трат сохраняются).
+
+STATE_SAVE_EVERY = 2.0    # секунд
+
+
+def _dt(d: Optional[datetime]) -> Optional[str]:
+    return d.isoformat() if d else None
+
+
+def _from_dt(s: Optional[str]) -> Optional[datetime]:
+    return datetime.fromisoformat(s) if s else None
+
+
+def parsed_to_dict(p: ParsedExpense) -> dict:
+    d = asdict(p)
+    d["date"] = _dt(p.date)
+    return d
+
+
+def parsed_from_dict(d: dict) -> ParsedExpense:
+    fields = {k: v for k, v in d.items() if k in ParsedExpense.__dataclass_fields__}
+    fields["date"] = _from_dt(fields.get("date"))
+    return ParsedExpense(**fields)
+
+
+def item_to_dict(item: Item) -> dict:
+    d = dict(kind=item.kind, file_id=item.file_id, text=item.text, name=item.name, key=item.key,
+             force=item.force, raw=item.raw, queued=item.queued,
+             parsed=parsed_to_dict(item.parsed) if item.parsed else None)
+    t = item.task
+    if item.kind != "op" and t is not None and t.done() and not t.cancelled() and t.exception() is None:
+        rec = t.result()
+        if not rec.parsed.error:
+            # Claude уже прочитал чек: сохраняем результат, чтобы не платить за чтение второй раз
+            d.update(kind="op", parsed=parsed_to_dict(rec.parsed), raw=rec.raw, file_id=rec.photo_id)
+    return d
+
+
+def item_from_dict(d: dict) -> Item:
+    parsed = parsed_from_dict(d["parsed"]) if d.get("parsed") else None
+    return Item(kind=d["kind"], file_id=d.get("file_id"), text=d.get("text"), name=d.get("name") or "",
+                parsed=parsed, key=d.get("key") or "", force=bool(d.get("force")), raw=d.get("raw") or "",
+                queued=bool(d.get("queued")))
+
+
+def expense_to_dict(e: Expense) -> dict:
+    d = asdict(e)
+    d["date"] = _dt(e.date)
+    return d
+
+
+def expense_from_dict(d: dict) -> Expense:
+    fields = {k: v for k, v in d.items() if k in Expense.__dataclass_fields__}
+    fields["date"] = _from_dt(fields["date"])
+    if fields.get("hint"):
+        fields["hint"] = tuple(fields["hint"])
+    return Expense(**fields)
+
+
+def snapshot() -> dict:
+    users = {}
+    for uid, st in STATES.items():
+        u = {"chat_id": st.chat_id}
+        if st.current is not None:
+            u["current"] = expense_to_dict(st.current)
+        if st.queue:
+            u["queue"] = [item_to_dict(i) for i in st.queue]
+        if st.recon is not None:
+            u["recon"] = {
+                "files": [asdict(f) for f in st.recon.files],
+                "stage": st.recon.stage,
+                "missing": [dict(date=_dt(o.date), rub=o.rub, merchant=o.merchant, bank=o.bank)
+                            for o in st.recon.missing],
+            }
+        if st.dups:
+            u["dups"] = {str(k): expense_to_dict(v) for k, v in st.dups.items()}
+        if st.saved:
+            u["saved"] = {str(k): list(v) for k, v in st.saved.items()}
+        if len(u) > 1:
+            users[str(uid)] = u
+    return {"version": 1, "last_eid": _last_eid, "users": users}
+
+
+def restore(data: dict) -> None:
+    global _last_eid
+    _last_eid = max(_last_eid, int(data.get("last_eid") or 0))
+    for uid, u in (data.get("users") or {}).items():
+        st = UserState(chat_id=int(u.get("chat_id") or uid))
+        if u.get("current"):
+            st.current = expense_from_dict(u["current"])
+        st.queue.extend(item_from_dict(i) for i in u.get("queue") or [])
+        if u.get("recon"):
+            r = u["recon"]
+            stage = r.get("stage") or "collect"
+            st.recon = ReconState(
+                files=[ReconFile(**f) for f in r.get("files") or []],
+                stage="collect" if stage == "working" else stage,      # чтение прервалось: файлы просим подтвердить
+                missing=[StatementOp(date=_from_dt(o["date"]), rub=o["rub"], merchant=o["merchant"],
+                                     bank=o.get("bank") or "") for o in r.get("missing") or []],
+            )
+            if st.recon.stage == "pick" and not st.recon.missing:
+                st.recon = None
+        st.dups = {int(k): expense_from_dict(v) for k, v in (u.get("dups") or {}).items()}
+        for k, v in (u.get("saved") or {}).items():
+            ref, row, where, amount = v
+            st.saved[int(k)] = (tuple(ref) if isinstance(ref, list) else ref, row, where, amount)
+        STATES[int(uid)] = st
+
+
+def load_state() -> None:
+    try:
+        with open(config.STATE_FILE, encoding="utf-8") as f:
+            restore(json.load(f))
+        log.info("Состояние восстановлено из %s", config.STATE_FILE.name)
+    except FileNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001
+        log.exception("Не удалось прочитать %s, начинаю с чистого листа", config.STATE_FILE.name)
+
+
+def write_state(last: Optional[str] = None) -> Optional[str]:
+    """Пишет состояние, если оно изменилось. Возвращает записанный текст (для сравнения в следующий раз)."""
+    try:
+        text = json.dumps(snapshot(), ensure_ascii=False, sort_keys=True)
+    except Exception:  # noqa: BLE001
+        log.exception("Не удалось подготовить состояние к сохранению")
+        return last
+    if text == last:
+        return last
+    try:
+        tmp = config.STATE_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, config.STATE_FILE)
+    except OSError as e:
+        log.warning("Не удалось сохранить состояние: %s", e)
+        return last
+    return text
+
+
+async def state_saver() -> None:
+    last = None
+    while True:
+        await asyncio.sleep(STATE_SAVE_EVERY)
+        last = write_state(last)
+
+
+async def resume_after_restart(bot: Bot) -> None:
+    """После перезапуска напоминает, на чём остановились, и продолжает очередь."""
+    for uid, st in list(STATES.items()):
+        try:
+            async with st.lock:
+                if st.current is not None or st.queue:
+                    waiting = len(st.queue)
+                    tail = f" В очереди ещё: {waiting}." if waiting else ""
+                    await bot.send_message(st.chat_id, f"♻️ Бот перезапускался, ничего не потерялось.{tail}")
+                    if st.current is not None:
+                        if st.current.stage == "amount" or st.current.amount <= 0:
+                            st.current.stage = "amount"
+                            await bot.send_message(st.chat_id, f"Продолжаем: {AMOUNT_HINT}",
+                                                   reply_markup=amount_kb(st.current))
+                        else:
+                            await show_question(bot, st)
+                rs = st.recon
+                if rs is not None and rs.stage == "collect" and rs.files:
+                    await bot.send_message(
+                        st.chat_id, f"♻️ Сверка: принято файлов {len(rs.files)}. Пришли ещё или нажми «Готово».",
+                        reply_markup=recon_kb())
+                elif rs is not None and rs.stage == "pick":
+                    await bot.send_message(
+                        st.chat_id, f"♻️ Сверка: жду номера операций для внесения (из {len(rs.missing)}), "
+                                    "<code>все</code> или <code>нет</code>.")
+                kick(bot, st)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось продолжить после перезапуска")
 
 
 # ---------------------------------------------------------------- запуск
@@ -935,7 +1347,11 @@ async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(config.BASE_DIR / "bot.log", encoding="utf-8")],
+        handlers=[
+            logging.StreamHandler(),
+            # журнал не растёт бесконечно: 3 файла по 5 МБ (bot.log, bot.log.1, bot.log.2)
+            RotatingFileHandler(config.BASE_DIR / "bot.log", maxBytes=5_000_000, backupCount=2, encoding="utf-8"),
+        ],
     )
     try:
         storage = get_storage()  # если таблица недоступна, узнаем сразу, а не при первой трате
@@ -969,10 +1385,19 @@ async def main() -> None:
         await bot.delete_webhook(drop_pending_updates=False)
     except TelegramNetworkError as e:
         log.warning("Не удалось сбросить webhook (%s), продолжаю", e)
-    recon_task = None
+    load_state()
+    # держим ссылки на фоновые задачи, чтобы их не удалил сборщик мусора
+    background = [asyncio.create_task(state_saver())]
     if config.RECON_ENABLED:
-        recon_task = asyncio.create_task(weekly_loop(bot))  # держим ссылку, чтобы задачу не удалил сборщик мусора
-    await dp.start_polling(bot)
+        background.append(asyncio.create_task(weekly_loop(bot)))
+    await resume_after_restart(bot)
+    schedule_flush(bot)      # строки, не записанные из-за сбоя таблицы до перезапуска
+    try:
+        await dp.start_polling(bot)
+    finally:
+        for task in background:
+            task.cancel()
+        write_state()
 
 
 if __name__ == "__main__":
