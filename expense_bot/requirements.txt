@@ -1,0 +1,6 @@
+aiogram>=3.13,<4
+anthropic>=0.40
+gspread>=6.0,<7
+python-dotenv>=1.0
+tzdata
+openpyxl>=3.1
